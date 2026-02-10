@@ -43,4 +43,8 @@ The script is read-only and does not make any system changes.
 
 ## How to run
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\singleVmMinimal_IIS_ObservedPorts_ExcelOrCsv.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\vmdiscovery\script.ps1
+```In powershell
+> Unblock-File .\vmdiscovery\script.ps1
+> .\vmdiscovery\script.ps1
+
