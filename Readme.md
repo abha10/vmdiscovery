@@ -45,7 +45,7 @@ The script is read-only and does not make any system changes.
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\vmdiscovery\script.ps1
 ```
-OR
+OR In powershell terminal
 ```
 > Unblock-File .\vmdiscovery\script.ps1
 > .\vmdiscovery\script.ps1
