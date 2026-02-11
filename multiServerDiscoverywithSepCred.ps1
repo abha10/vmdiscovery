@@ -1,9 +1,7 @@
 #requires -Version 5.1
 param(
-  [string] $ServerListPath = ".\servers.txt",
-  [string] $OutputRoot = ".",
-  [string] $Username = "",
-  [string] $Password = ""  #If interactive, leave blank and you will be prompted.
+  [string] $ServerCsvPath = ".\servers.csv",
+  [string] $OutputRoot = "."
 )
 
 Set-StrictMode -Version Latest
@@ -11,22 +9,12 @@ $ErrorActionPreference = "Stop"
 
 function Log { param([string]$m) Write-Host ("[{0}] {1}" -f (Get-Date -Format "HH:mm:ss"), $m) }
 function Release-ComObjectSafe { param($obj) try { if ($null -ne $obj) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($obj) } } catch { } }
-function ToArray { param($x) @($x) }
 
-if (-not (Test-Path $ServerListPath)) { throw "servers.txt not found: $ServerListPath" }
-$servers = Get-Content $ServerListPath | ForEach-Object { $_.Trim() } | Where-Object { $_ -and -not $_.StartsWith("#") } | Select-Object -Unique
-if (@($servers).Count -eq 0) { throw "servers.txt is empty." }
+if (-not (Test-Path $ServerCsvPath)) { throw "servers.csv not found: $ServerCsvPath" }
+$targets = Import-Csv $ServerCsvPath
+if (@($targets).Count -eq 0) { throw "servers.csv is empty." }
 
-# Build credential
-$cred = $null
-if ($Username -and $Password) {
-  $sec = ConvertTo-SecureString $Password -AsPlainText -Force
-  $cred = New-Object System.Management.Automation.PSCredential($Username, $sec)
-} else {
-  $cred = Get-Credential -Message "Enter credentials that work on all target servers"
-}
-
-# ---------- Remote collectors (runs on each target) ----------
+# --- Remote payload (runs on each server) ---
 $remoteSb = {
   Set-StrictMode -Version Latest
   $ErrorActionPreference = "Stop"
@@ -135,6 +123,7 @@ $remoteSb = {
     $sites=@(); $pools=@(); $apps=@(); $bindings=@()
     try {
       Import-Module WebAdministration -ErrorAction Stop | Out-Null
+
       try { $sites = @(Get-Website | Select-Object Name, State, PhysicalPath, ApplicationPool, ID) } catch { $sites=@() }
 
       try {
@@ -190,6 +179,7 @@ $remoteSb = {
         }
         $bindings = @($bindings)
       } catch { $bindings=@() }
+
     } catch { }
 
     [pscustomobject]@{ Present=$true; Sites=@($sites); AppPools=@($pools); Apps=@($apps); Bindings=@($bindings) }
@@ -243,7 +233,7 @@ $remoteSb = {
   }
 }
 
-# ---------- Excel COM writer ----------
+# --- Excel COM writer (offline) ---
 function Write-Worksheet {
   param($workbook, [string]$name, $data)
 
@@ -272,7 +262,7 @@ function Write-Worksheet {
 }
 
 function Try-WriteExcelCom {
-  param([string]$xlsxPath, $dash, $ports, $apps, $iisSites, $iisPools, $iisApps, $iisBindings)
+  param([string]$xlsxPath, $dash, $ports, $apps, $iisSites, $iisPools, $iisApps, $iisBindings, $failures)
 
   $excel = $null; $wb = $null
   try {
@@ -280,16 +270,16 @@ function Try-WriteExcelCom {
     $excel.Visible = $false
     $excel.DisplayAlerts = $false
     $wb = $excel.Workbooks.Add()
-
     while ($wb.Worksheets.Count -gt 0) { $wb.Worksheets.Item(1).Delete() }
 
-    Write-Worksheet $wb "00-Dashboard"              $dash
-    Write-Worksheet $wb "Observed_Listening_Ports"  $ports
-    Write-Worksheet $wb "Installed_Apps"            $apps
+    Write-Worksheet $wb "00-Dashboard"             $dash
+    Write-Worksheet $wb "Observed_Listening_Ports" $ports
+    Write-Worksheet $wb "Installed_Apps"           $apps
     if (@($iisSites).Count    -gt 0) { Write-Worksheet $wb "IIS_Sites"    $iisSites }
     if (@($iisPools).Count    -gt 0) { Write-Worksheet $wb "IIS_AppPools" $iisPools }
     if (@($iisApps).Count     -gt 0) { Write-Worksheet $wb "IIS_Apps"     $iisApps }
     if (@($iisBindings).Count -gt 0) { Write-Worksheet $wb "IIS_Bindings" $iisBindings }
+    if (@($failures).Count    -gt 0) { Write-Worksheet $wb "Failures"     $failures }
 
     $wb.SaveAs($xlsxPath)
     $wb.Close($true)
@@ -304,7 +294,7 @@ function Try-WriteExcelCom {
   }
 }
 
-# ---------- Run across servers ----------
+# --- Run across servers ---
 $stamp  = Get-Date -Format "yyyyMMdd-HHmmss"
 $outDir = Join-Path $OutputRoot ("MultiServer-Discovery-{0}" -f $stamp)
 New-Item -ItemType Directory -Path $outDir -Force | Out-Null
@@ -320,14 +310,27 @@ $iisAppsAll  = @()
 $iisBindAll  = @()
 $failAll = @()
 
-foreach ($s in $servers) {
-  Log ("Discovering: {0}" -f $s)
+foreach ($t in $targets) {
+  $server = $t.Server
+  $user   = $t.Username
+  $pass   = $t.Password
+
+  if (-not $server -or -not $user -or -not $pass) {
+    $failAll += [pscustomobject]@{ Server=$server; Error="Missing Server/Username/Password in servers.csv row." }
+    continue
+  }
+
+  Log ("Discovering: {0}" -f $server)
+
   try {
-    $res = Invoke-Command -ComputerName $s -Credential $cred -ScriptBlock $remoteSb -ErrorAction Stop
+    $sec  = ConvertTo-SecureString $pass -AsPlainText -Force
+    $cred = New-Object System.Management.Automation.PSCredential($user, $sec)
+
+    $res = Invoke-Command -ComputerName $server -Credential $cred -ScriptBlock $remoteSb -ErrorAction Stop
 
     $sum = $res.Summary
     $dashAll += [pscustomobject]@{
-      Server       = $s
+      Server       = $server
       ComputerName = $sum.ComputerName
       Domain       = $sum.Domain
       OS           = $sum.OS
@@ -345,7 +348,7 @@ foreach ($s in $servers) {
 
     foreach ($p in @($res.ObservedPorts)) {
       $portsAll += [pscustomobject]@{
-        Server        = $s
+        Server        = $server
         Protocol      = $p.Protocol
         LocalAddress  = $p.LocalAddress
         LocalPort     = $p.LocalPort
@@ -357,7 +360,7 @@ foreach ($s in $servers) {
 
     foreach ($a in @($res.Apps)) {
       $appsAll += [pscustomobject]@{
-        Server         = $s
+        Server         = $server
         DisplayName    = $a.DisplayName
         DisplayVersion = $a.DisplayVersion
         Publisher      = $a.Publisher
@@ -366,32 +369,30 @@ foreach ($s in $servers) {
     }
 
     if ($res.IIS -and $res.IIS.Present -eq $true) {
-      foreach ($x in @($res.IIS.Sites))    { $iisSitesAll += ($x | Select-Object @{n="Server";e={$s}}, *) }
-      foreach ($x in @($res.IIS.AppPools)) { $iisPoolsAll += ($x | Select-Object @{n="Server";e={$s}}, *) }
-      foreach ($x in @($res.IIS.Apps))     { $iisAppsAll  += ($x | Select-Object @{n="Server";e={$s}}, *) }
-      foreach ($x in @($res.IIS.Bindings)) { $iisBindAll  += ($x | Select-Object @{n="Server";e={$s}}, *) }
+      foreach ($x in @($res.IIS.Sites))    { $iisSitesAll += ($x | Select-Object @{n="Server";e={$server}}, *) }
+      foreach ($x in @($res.IIS.AppPools)) { $iisPoolsAll += ($x | Select-Object @{n="Server";e={$server}}, *) }
+      foreach ($x in @($res.IIS.Apps))     { $iisAppsAll  += ($x | Select-Object @{n="Server";e={$server}}, *) }
+      foreach ($x in @($res.IIS.Bindings)) { $iisBindAll  += ($x | Select-Object @{n="Server";e={$server}}, *) }
     }
-  } catch {
-    $failAll += [pscustomobject]@{ Server=$s; Error=$_.Exception.Message }
+  }
+  catch {
+    $failAll += [pscustomobject]@{ Server=$server; Error=$_.Exception.Message }
   }
 }
 
-# ---------- Write output ----------
-Log "Writing Excel (COM). If COM fails, writing single CSV..."
+Log "Writing Excel (COM). If COM fails, writing CSV..."
 $excelOk = Try-WriteExcelCom -xlsxPath $xlsx `
   -dash $dashAll -ports $portsAll -apps $appsAll `
-  -iisSites $iisSitesAll -iisPools $iisPoolsAll -iisApps $iisAppsAll -iisBindings $iisBindAll
+  -iisSites $iisSitesAll -iisPools $iisPoolsAll -iisApps $iisAppsAll -iisBindings $iisBindAll `
+  -failures $failAll
 
 if ($excelOk) {
-  if (@($failAll).Count -gt 0) {
-    # Add failures in CSV next to xlsx for convenience
-    $failAll | Export-Csv -Path (Join-Path $outDir "Failures.csv") -NoTypeInformation -Encoding UTF8
-  }
   Log "DONE."
   Log ("Output folder: {0}" -f $outDir)
   Log ("Excel file:    {0}" -f $xlsx)
 } else {
-  # Single CSV with sections
+  Log "Excel COM failed. Falling back to single CSV..."
+
   $rows = New-Object System.Collections.Generic.List[object]
 
   foreach ($d in @($dashAll)) {
@@ -399,8 +400,20 @@ if ($excelOk) {
       $rows.Add([pscustomobject]@{ Section="Dashboard"; Server=$d.Server; Name=$pp.Name; Value=[string]$pp.Value; Col1=$null; Col2=$null; Col3=$null; Col4=$null }) | Out-Null
     }
   }
-  foreach ($p in @($portsAll)) { $rows.Add([pscustomobject]@{ Section="Observed_Listening_Ports"; Server=$p.Server; Name=("{0}/{1}" -f $p.Protocol,$p.LocalPort); Value=$p.LocalAddress; Col1=$p.ProcessName; Col2=$p.Service; Col3=$p.OwningProcess; Col4=$null }) | Out-Null }
-  foreach ($a in @($appsAll))  { $rows.Add([pscustomobject]@{ Section="Installed_Apps"; Server=$a.Server; Name=$a.DisplayName; Value=$a.DisplayVersion; Col1=$a.Publisher; Col2=$a.InstallDate; Col3=$null; Col4=$null }) | Out-Null }
+
+  foreach ($p in @($portsAll)) {
+    $rows.Add([pscustomobject]@{
+      Section="Observed_Listening_Ports"; Server=$p.Server; Name=("{0}/{1}" -f $p.Protocol,$p.LocalPort); Value=$p.LocalAddress;
+      Col1=$p.ProcessName; Col2=$p.Service; Col3=$p.OwningProcess; Col4=$null
+    }) | Out-Null
+  }
+
+  foreach ($a in @($appsAll)) {
+    $rows.Add([pscustomobject]@{
+      Section="Installed_Apps"; Server=$a.Server; Name=$a.DisplayName; Value=$a.DisplayVersion;
+      Col1=$a.Publisher; Col2=$a.InstallDate; Col3=$null; Col4=$null
+    }) | Out-Null
+  }
 
   foreach ($x in @($iisSitesAll)) { $rows.Add([pscustomobject]@{ Section="IIS_Sites"; Server=$x.Server; Name=$x.Name; Value=$x.State; Col1=$x.PhysicalPath; Col2=$x.ApplicationPool; Col3=$x.ID; Col4=$null }) | Out-Null }
   foreach ($x in @($iisPoolsAll)) { $rows.Add([pscustomobject]@{ Section="IIS_AppPools"; Server=$x.Server; Name=$x.Name; Value=$x.State; Col1=$x.Runtime; Col2=$x.PipelineMode; Col3=$x.IdentityType; Col4=$null }) | Out-Null }
