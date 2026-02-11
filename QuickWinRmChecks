@@ -1,0 +1,11 @@
+# DNS
+Resolve-DnsName Server01
+
+# WinRM
+Test-WSMan Server01
+
+# WMI (DCOM)
+Get-CimInstance Win32_OperatingSystem -ComputerName Server01 -Credential $cred
+
+# SMB
+Test-Path \\Server01\C$
